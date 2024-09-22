@@ -1,7 +1,7 @@
 # Nautilus Taildrop
 Nautilus extension for sending and receiving files with [Taildrop](https://tailscale.com/taildrop) (Tailscale)
 
->[!info]
+>[!IMPORTANT]
 > Taildrop can't transfer files to devices of other users or devices that are tagged:
 > https://tailscale.com/kb/1106/taildrop#send-files-with-taildrop
 ## Setup
@@ -55,7 +55,7 @@ rm ~/.local/share/nautilus-python/extensions/nautilus-taildrop.py
 ```
 
 ## Modification
->[!info]
+>[!NOTE]
 > Modification require Nautilus to be reloaded:
 > Run `nautilus -q`
 ### Show full DNS names
