@@ -11,47 +11,22 @@ Run Tailscale with
 tailscale up --operator $USER
 ```
 ### Requirements
-#### Ubuntu/Debian/Mint
-```shell
-sudo apt install python3-nautilus python3-gi
-```
+Ubuntu/Debian/Mint: `sudo apt install python3-nautilus python3-gi`
 
-#### RHEL/Fedora
-```shell
-sudo dnf install nautilus-python python3-gobject
-```
+RHEL/Fedora: `sudo dnf install nautilus-python python3-gobject`
 
-#### Arch
-```shell
-sudo pacman -S python-nautilus python-gobject
-```
+Arch: `sudo pacman -S python-nautilus python-gobject`
 
 ### Install extension
  ```shell
 git clone https://github.com/jahtz/nautilus-taildrop.git
- ```
-
-#### Method 1: make
-```shell
 cd nautilus-taildrop
 make install
-```
-
-####  Method 2: manual
-```shell
-mkdir -p ~/.local/share/nautilus-python/extensions
-cp nautilus-taildrop/nautilus-taildrop.py ~/.local/share/nautilus-python/extensions
-```
+````
 
 ### Remove extension
-#### Method 1: make
 ```shell
 make uninstall
-```
-
-#### Method 2: manual
-```shell
-rm ~/.local/share/nautilus-python/extensions/nautilus-taildrop.py
 ```
 
 ## Modification
