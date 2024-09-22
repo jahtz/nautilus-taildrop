@@ -56,7 +56,7 @@ rm ~/.local/share/nautilus-python/extensions/nautilus-taildrop.py
 
 ## Modification
 >[!NOTE]
-> Modification require Nautilus to be reloaded:
+> Modifications require Nautilus to be reloaded:
 > Run `nautilus -q`
 ### Show full DNS names
 If you want to show full DNS names (e.g. _yourdevice.your-tailnet.ts.net_) instead of device names (e.g. _yourdevice_), 
