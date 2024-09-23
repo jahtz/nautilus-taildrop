@@ -1,136 +1,107 @@
-# Copyright 2024 Janik Haitz
+# Nautilus Admin - Extension for Nautilus to do administrative operations
+# Copyright (C) 2024 Janik Haitz
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import json
 import subprocess
 from urllib.parse import unquote, urlparse
 from pathlib import Path
 
-import gi
-
-pygi_version = '3.0' if gi.version_info[1] < 40 else '4.0'
-gi.require_version('Nautilus', pygi_version)
+from gi import require_version
+try:
+	require_version('Nautilus', '4.0')
+	require_version('Gtk', '4.0')
+except:
+    require_version('Nautilus', '3.0')
+    require_version('Gtk', '3.0')
 from gi.repository import GObject, Nautilus
 
 
-### Settings
-SHOW_DNS_NAME = False
+### Settings ###
+# If enabled, show devices as `yourdevice.yourtailnet.ts.net`, else `yourdevice`
+SHOW_FULL_DNS_NAME = False
+# If enabled, hide offline devices, else show them grayed out
+HIDE_OFFLINE = False
 
 
-class Tailscale:
-    @staticmethod
-    def get_devices() -> list[tuple[str, bool]]:
-        """
-        Load a list of devices that are connected to tailscale.
-        Only use devices that are by the current user, are not tagged.
-        -> https://tailscale.com/kb/1106/taildrop#send-files-with-taildrop
-
-        :return: list of tailscale DNSNames and their online state.
-        """
-        process = subprocess.run(['tailscale', 'status', '--json'], capture_output=True, check=False)
-        tailnet_status = json.loads(process.stdout)
-        peers = tailnet_status['Peer']
-        users = tailnet_status['User']
-        self_id: int = tailnet_status['Self']['UserID']
-
-        devices: list[tuple[str, bool]] = []
-        for _, device_info in peers.items():
-            if device_info['UserID'] == self_id:
-                device_dns_name = device_info['DNSName']
-                if device_dns_name.endswith('.'):
-                    device_dns_name = device_dns_name[:-1]
-                devices.append((device_dns_name, device_info['Online']))
-        return sorted(devices, key=lambda d: d[0])
-
-    @staticmethod
-    def taildrop_send(fp: Path, dns_name: str):
-        """
-        Send a file with Taildrop.
-
-        :param fp: File to send.
-        :param dns_name: Target device DNS name.
-        """
-        subprocess.Popen(['tailscale', 'file', 'cp', fp.as_posix(), dns_name + ':'])
-
-    @staticmethod
-    def taildrop_receive(fp: Path):
-        """
-        Receive file(s) with Taildrop.
-
-        :param fp: Directory where file(s) should be downloaded to.
-        """
-        subprocess.Popen(['tailscale', 'file', 'get', fp])
-
-
-class TaildropExtension(GObject.GObject, Nautilus.MenuProvider):
+class NautilusTaildrop(GObject.GObject, Nautilus.MenuProvider):
     def __init__(self):
-        pass
+        self.devices: list[tuple[str, bool]] = []
+        self._update_devices()
 
-    @staticmethod
-    def callback_send(_menu, files: list[Nautilus.FileInfo], dns_name: str):
-        """
-        Callback handler for sending files to a device in your Tailnet.
-
-        :param _menu: Nautilus menu object.
-        :param files: list of files to send.
-        :param dns_name: DNS name of target device.
-        """
-        for fp in files:
-            fp = Path(unquote(urlparse(fp.get_uri()).path))
-            Tailscale.taildrop_send(fp, dns_name)
-
-    @staticmethod
-    def callback_receive(_menu, current_folder: Nautilus.FileInfo):
-        """
-        Callback handler for receiving files from a device in your Tailnet.
-
-        :param _menu: Nautilus menu object.
-        :param current_folder: Target directory to save received file in.
-        """
-        fp = Path(unquote(urlparse(current_folder.get_uri()).path))
-        Tailscale.taildrop_receive(fp)
-    def get_file_items(self, files: list[Nautilus.FileInfo]):
-        """
-        Executed when a file is selected.
-        Create a menu entry for sending files with Taildrop and a submenu containing all available devices.
-
-        :param files: list of selected files.
-        """
+    def get_file_items(self, selected_files: list[Nautilus.FileInfo]):
         send_files_menu = Nautilus.MenuItem(name='TaildropExtension::Devices',
                                             label='Taildrop Send',
                                             tip='Send selected files.')
         device_list_menu = Nautilus.Menu()
         send_files_menu.set_submenu(device_list_menu)
-
-        for idx, device in enumerate(Tailscale.get_devices()):
-            label = device[0] if SHOW_DNS_NAME else device[0].split('.')[0]
+        for idx, device in enumerate(self.devices):
             device_item = Nautilus.MenuItem(name=f'TaildropExtension::Device{idx}',
-                                            label=label,
+                                            label=device[0] if SHOW_FULL_DNS_NAME else device[0].split('.')[0],
                                             tip=f'Send selected files to {device[0]}.',
                                             sensitive=device[1])
-            device_item.connect('activate', self.callback_send, files, device[0])
+            device_item.connect('activate', self._taildrop_send, selected_files, device[0])
             device_list_menu.append_item(device_item)
+        
+        update_item = Nautilus.MenuItem(name='TaildropExtension::DevicesUpdate',
+                                            label='Update devices',
+                                            tip='Update device list.')
+        update_item.connect('activate', self._update_devices)
+        device_list_menu.append_item(update_item)
+
         return (send_files_menu, )
 
-    def get_background_items(self, current_folder: Nautilus.FileInfo):
-        """
-        Executed when no file is selected.
-        Creates a menu entry for receiving files from Taildrop.
-        :param current_folder: Current directory.
-        """
+    def get_background_items(self, current_directory: Nautilus.FileInfo):
         receive_item = Nautilus.MenuItem(name='TaildropExtension::Receive',
                                          label='Taildrop Receive',
                                          tip='Receive files here.')
-        receive_item.connect('activate', self.callback_receive, current_folder)
+        receive_item.connect('activate', self._taildrop_receive, current_directory)
         return (receive_item, )
+
+    def _update_devices(self, _menu = None):
+        """ Update devices """
+        process = subprocess.run(['tailscale', 'status', '--json'], capture_output=True, check=False)
+        tailnet_status = json.loads(process.stdout)
+
+        user_id: int = tailnet_status['Self']['UserID']
+        devices: list[tuple[str, bool]] = []
+        for _, device_info in tailnet_status['Peer'].items():
+            if HIDE_OFFLINE and not device_info['Online']:
+                continue
+            if device_info['UserID'] == user_id:
+                device_dns_name = device_info['DNSName']
+                if device_dns_name.endswith('.'):
+                    device_dns_name = device_dns_name[:-1]
+                devices.append((device_dns_name, device_info['Online']))
+        self.devices = devices
+    
+    @staticmethod
+    def _taildrop_send(_menu, selected_files: list[Nautilus.FileInfo], dns_name: str):
+        valid_files: list[Path] = []
+        for file in selected_files:
+            if not file.get_uri_scheme() == "file": # must be a local file/directory
+                continue
+            fp = Path(unquote(urlparse(file.get_uri()).path))
+            if fp.is_dir():  # expand directories (not natively supported)
+                valid_files.extend([f for f in fp.glob('*') if f.is_file()])
+            else:
+                valid_files.append(fp)
+        for file in valid_files:
+            subprocess.Popen(['tailscale', 'file', 'cp', file.as_posix(), f'{dns_name}:'])
+
+    @staticmethod   
+    def _taildrop_receive(_menu, current_directory: Nautilus.FileInfo):
+        file = Path(unquote(urlparse(current_directory.get_uri()).path))
+        subprocess.Popen(['tailscale', 'file', 'get', file])
