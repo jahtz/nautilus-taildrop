@@ -14,94 +14,168 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-import json
-import subprocess
 from urllib.parse import unquote, urlparse
+from dataclasses import dataclass
+from enum import Enum
+from typing import Optional
 from pathlib import Path
+import multiprocessing
+import subprocess
+import json
 
 from gi import require_version
+require_version('Notify', '0.7')
 try:
-	require_version('Nautilus', '4.0')
-	require_version('Gtk', '4.0')
+    require_version('Nautilus', '4.0')
+    require_version('Gtk', '4.0')
 except:
     require_version('Nautilus', '3.0')
     require_version('Gtk', '3.0')
-from gi.repository import GObject, Nautilus
+from gi.repository import GObject, Nautilus, Notify
 
 
-### Settings ###
-# If enabled, show devices as `yourdevice.yourtailnet.ts.net`, else `yourdevice`
-SHOW_FULL_DNS_NAME = False
-# If enabled, hide offline devices, else show them grayed out
-HIDE_OFFLINE = False
+class ProcessType(Enum):
+    IDLE = 0
+    SEND = 1
+    RECEIVE = 2
+
+
+@dataclass
+class Device:
+    dns_name: str
+    display_name: str
+    online: bool
 
 
 class NautilusTaildrop(GObject.GObject, Nautilus.MenuProvider):
     def __init__(self):
-        self.devices: list[tuple[str, bool]] = []
-        self._update_devices()
+        super().__init__()
+        Notify.init('NautilusTaildropNotifier')
 
-    def get_file_items(self, selected_files: list[Nautilus.FileInfo]):
-        send_files_menu = Nautilus.MenuItem(name='TaildropExtension::Devices',
-                                            label='Taildrop Send',
-                                            tip='Send selected files.')
-        device_list_menu = Nautilus.Menu()
-        send_files_menu.set_submenu(device_list_menu)
-        for idx, device in enumerate(self.devices):
-            device_item = Nautilus.MenuItem(name=f'TaildropExtension::Device{idx}',
-                                            label=device[0] if SHOW_FULL_DNS_NAME else device[0].split('.')[0],
-                                            tip=f'Send selected files to {device[0]}.',
-                                            sensitive=device[1])
-            device_item.connect('activate', self._taildrop_send, selected_files, device[0])
-            device_list_menu.append_item(device_item)
-        
-        update_item = Nautilus.MenuItem(name='TaildropExtension::DevicesUpdate',
-                                            label='Update devices',
-                                            tip='Update device list.')
-        update_item.connect('activate', self._update_devices)
-        device_list_menu.append_item(update_item)
+        self.devices: list[Device] = []
+        self.update_devices(None)
+        self.queue: multiprocessing.Queue = multiprocessing.Queue()
+        self.process: Optional[multiprocessing.Process] = None
+        self.process_type: ProcessType = ProcessType.IDLE
 
-        return (send_files_menu, )
+    @staticmethod
+    def send_notification(header: str, body: str, error: bool):
+        notification = Notify.Notification.new(header, body, "dialog-error" if error else "dialog-ok")
+        notification.show()
 
-    def get_background_items(self, current_directory: Nautilus.FileInfo):
-        receive_item = Nautilus.MenuItem(name='TaildropExtension::Receive',
-                                         label='Taildrop Receive',
-                                         tip='Receive files here.')
-        receive_item.connect('activate', self._taildrop_receive, current_directory)
-        return (receive_item, )
+    @staticmethod
+    def send_files(selected_files: list[Nautilus.FileInfo], device: Device, queue: multiprocessing.Queue) -> None:
+        for file in selected_files:
+            fp = Path(unquote(urlparse(file.get_uri()).path))
+            process = subprocess.Popen(
+                ['tailscale', 'file', 'cp', fp.as_posix(), f'{device.dns_name}:'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            stdout, stderr = process.communicate()
+            if process.returncode != 0:
+                body = f'Error sending "{fp.name}" to "{device.display_name}": {stderr.decode().strip()}.'
+                queue.put(('Taildrop', body, True))
+                print(f'Taildrop: {body}')
+                break
+        body = f'Successfully sent {len(selected_files)} file{"s" if len(selected_files) > 1 else ""} to "{device.display_name}".'
+        queue.put(('Taildrop', body, False))
+        print(f'Taildrop: {body}')
 
-    def _update_devices(self, _menu = None):
-        """ Update devices """
+    @staticmethod
+    def receive_files(current_directory: Nautilus.FileInfo, queue: multiprocessing.Queue) -> None:
+        directory = Path(unquote(urlparse(current_directory.get_uri()).path))
+        process = subprocess.Popen(
+            ['tailscale', 'file', 'get', directory.as_posix()],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        stdout, stderr = process.communicate()
+        if process.returncode != 0:
+            body = f'Error receiving files: {stderr.decode().strip()}.'
+            queue.put(('Taildrop', body, True))
+            print(f'Taildrop: {body}')
+        else:
+            body = f'Successfully received file(s).'
+            queue.put(('Taildrop', body, False))
+            print(f'Taildrop: {body}')
+
+    def update_devices(self, _menu) -> None:
         process = subprocess.run(['tailscale', 'status', '--json'], capture_output=True, check=False)
         tailnet_status = json.loads(process.stdout)
-
-        user_id: int = tailnet_status['Self']['UserID']
-        devices: list[tuple[str, bool]] = []
+        user_id: int = tailnet_status['Self']['UserID']  # fetch current user id
+        self.devices.clear()
         for _, device_info in tailnet_status['Peer'].items():
-            if HIDE_OFFLINE and not device_info['Online']:
-                continue
             if device_info['UserID'] == user_id:
                 device_dns_name = device_info['DNSName']
                 if device_dns_name.endswith('.'):
                     device_dns_name = device_dns_name[:-1]
-                devices.append((device_dns_name, device_info['Online']))
-        self.devices = devices
-    
-    @staticmethod
-    def _taildrop_send(_menu, selected_files: list[Nautilus.FileInfo], dns_name: str):
-        valid_files: list[Path] = []
-        for file in selected_files:
-            if not file.get_uri_scheme() == "file": # must be a local file/directory
-                continue
-            fp = Path(unquote(urlparse(file.get_uri()).path))
-            if fp.is_dir():  # expand directories (not natively supported)
-                valid_files.extend([f for f in fp.glob('*') if f.is_file()])
-            else:
-                valid_files.append(fp)
-        for file in valid_files:
-            subprocess.Popen(['tailscale', 'file', 'cp', file.as_posix(), f'{dns_name}:'])
+                self.devices.append(Device(device_dns_name, device_dns_name.split('.')[0], device_info['Online']))
 
-    @staticmethod   
-    def _taildrop_receive(_menu, current_directory: Nautilus.FileInfo):
-        file = Path(unquote(urlparse(current_directory.get_uri()).path))
-        subprocess.Popen(['tailscale', 'file', 'get', file])
+    def background_process(self, _menu, pt: ProcessType, args: tuple = None) -> None:
+        if self.process_type == ProcessType.RECEIVE and self.process:
+            self.process.terminate()
+            self.process = None
+            self.process_type = ProcessType.IDLE
+        if self.process_type != ProcessType.IDLE or self.process:
+            print('Taildrop: Background process already running')
+            return
+
+        self.queue = multiprocessing.Queue()  # reset queue
+        match pt:
+            case ProcessType.SEND:
+                self.process = multiprocessing.Process(target=self.send_files, args=args + (self.queue,))
+                print('Taildrop: Sending files...')
+            case ProcessType.RECEIVE:
+                self.process = multiprocessing.Process(target=self.receive_files, args=args + (self.queue,))
+                print('Taildrop: Receiving files...')
+            case _:
+                print('Taildrop: Unknown process type')
+                return
+        self.process_type = pt
+        self.process.start()
+        GObject.timeout_add(100, self.queue_watcher)
+
+    def queue_watcher(self) -> bool:
+        if not self.queue.empty():
+            header, body, error = self.queue.get()
+            print(header, body)
+            self.send_notification(header, body, error)
+            self.process = None
+            self.process_type = ProcessType.IDLE
+            return False
+        if self.process and not self.process.is_alive():  # cleanup process if it is done
+            self.process = None
+            self.process_type = ProcessType.IDLE
+            return False
+        return True
+
+    def get_file_items(self, selected_files: list[Nautilus.FileInfo]) -> Optional[list[Nautilus.MenuItem]]:
+        if any(file.is_directory() for file in selected_files):
+            return  # Taildrop only supports files
+        send_menu = Nautilus.MenuItem(name='TaildropExtension::Devices',
+                                      label='Taildrop Send',
+                                      tip='Send selected files.')
+        device_menu = Nautilus.Menu()
+        send_menu.set_submenu(device_menu)
+        for idx, device in enumerate(self.devices):
+            device_item = Nautilus.MenuItem(name=f'TaildropExtension::Device{idx}',
+                                            label=device.display_name,
+                                            tip=f'Send selected files to {device.display_name}.',
+                                            sensitive=device.online)
+            device_item.connect('activate', self.background_process, ProcessType.SEND, (selected_files, device))
+            device_menu.append_item(device_item)
+        update_item = Nautilus.MenuItem(name='TaildropExtension::DevicesUpdate',
+                                        label='Update devices',
+                                        tip='Update device list.')
+        update_item.connect('activate', self.update_devices)
+        device_menu.append_item(update_item)
+        return [send_menu]
+
+    def get_background_items(self, current_directory: Nautilus.FileInfo) -> Optional[list[Nautilus.MenuItem]]:
+        receive_item = Nautilus.MenuItem(name='TaildropExtension::Receive',
+                                         label='Taildrop Receive',
+                                         tip='Receive files here.',
+                                         sensitive=self.process_type != ProcessType.SEND)
+        receive_item.connect('activate', self.background_process, ProcessType.RECEIVE, (current_directory,))
+        return [receive_item]
